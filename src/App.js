@@ -7,15 +7,16 @@ function App() {
   const canvasRef = useRef(null);
   const sceneRef = useRef(null);
   const handLandmarkerRef = useRef(null);
-  const cubeRef = useRef(null);
   const rendererRef = useRef(null);
   const cameraRef = useRef(null);
   const startedRef = useRef(false);
-  const isGrabbingRef = useRef(false);
+  const cubesRef = useRef([]);  // Array of all cubes
+  const handStatesRef = useRef([]);  // Per-hand state: { isDragging, anchorCube, lastSpawnPos, pinchStartPos }
+  const pinchIndicatorRef = useRef(null);  // Visual indicator for pinch
 
-  // Tunable thresholds (adjust these for your setup)
-  const pinchThreshold = 0.05;  // Distance between thumb & index to register pinch
-  const grabThreshold = 0.15;   // Distance from hand to cube to allow grabbing
+  // Tunable thresholds
+  const pinchThreshold = 0.05;
+  const dragThreshold = 0.5;  // Distance to drag before spawning
 
   useEffect(() => {
     if (startedRef.current) return;
@@ -33,20 +34,30 @@ function App() {
     renderer.setSize(640, 480);
     rendererRef.current = renderer;
 
-    // Create cube with subtle outline for "grabbable" feedback
-    const geometry = new THREE.BoxGeometry(1, 1, 1);
-    const material = new THREE.MeshBasicMaterial({ color: 0x00ff00, transparent: true, opacity: 0.8 });
-    const cube = new THREE.Mesh(geometry, material);
-    scene.add(cube);
-    cubeRef.current = cube;
+    // Main anchor cube (fixed in center)
+    const mainCube = new THREE.Mesh(
+      new THREE.BoxGeometry(1, 1, 1),
+      new THREE.MeshBasicMaterial({ color: 0x00ff00, transparent: true, opacity: 0.8 })
+    );
+    mainCube.position.set(0, 0, 0);
+    scene.add(mainCube);
+    cubesRef.current.push(mainCube);
 
-    // Add subtle outline (wireframe) to indicate grabbable state
+    // Add wireframe outline
     const outlineGeometry = new THREE.BoxGeometry(1.05, 1.05, 1.05);
     const outlineMaterial = new THREE.MeshBasicMaterial({ color: 0xffffff, wireframe: true });
     const outline = new THREE.Mesh(outlineGeometry, outlineMaterial);
-    cube.add(outline);  // Attach to cube
+    mainCube.add(outline);
 
-    // Append renderer to DOM
+    // Pinch indicator (red sphere)
+    const pinchGeometry = new THREE.SphereGeometry(0.1, 16, 16);
+    const pinchMaterial = new THREE.MeshBasicMaterial({ color: 0xff0000 });
+    const pinchIndicator = new THREE.Mesh(pinchGeometry, pinchMaterial);
+    pinchIndicator.visible = false;
+    scene.add(pinchIndicator);
+    pinchIndicatorRef.current = pinchIndicator;
+
+    // Append renderer
     const container = document.getElementById("three-container");
     if (container) container.appendChild(renderer.domElement);
 
@@ -57,7 +68,7 @@ function App() {
     };
     animate();
 
-    // Step 1: Enable two-hand detection
+    // Hand tracking setup (numHands: 2)
     const runHandLandmarker = async () => {
       const vision = await FilesetResolver.forVisionTasks(
         "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.0/wasm"
@@ -68,7 +79,7 @@ function App() {
           delegate: "GPU"
         },
         runningMode: "VIDEO",
-        numHands: 2,  // Detect up to 2 hands
+        numHands: 2,
         minHandDetectionConfidence: 0.5,
         minHandPresenceConfidence: 0.5,
         minTrackingConfidence: 0.5
@@ -91,80 +102,141 @@ function App() {
       const canvas = canvasRef.current;
       const ctx = canvas.getContext("2d");
 
-      // Step 3: Apply camera inversion (flip horizontally for natural interaction)
+      // Camera inversion
       ctx.clearRect(0, 0, canvas.width, canvas.height);
       ctx.save();
-      ctx.scale(-1, 1);  // Horizontal flip
+      ctx.scale(-1, 1);
       ctx.drawImage(videoRef.current, -canvas.width, 0, canvas.width, canvas.height);
       ctx.restore();
 
       if (handLandmarkerRef.current && videoRef.current) {
         const results = handLandmarkerRef.current.detectForVideo(videoRef.current, Date.now());
 
-        let closestHand = null;
-        let minDistance = Infinity;
-
-        // Step 2: Update rendering loop for both hands
         if (results.landmarks) {
           results.landmarks.forEach((landmarks, index) => {
-            // Assign colors: Hand 1 → red, Hand 2 → blue
+            // Initialize per-hand state if not exists
+            if (!handStatesRef.current[index]) {
+              handStatesRef.current[index] = {
+                isDragging: false,
+                anchorCube: null,
+                lastSpawnPos: null,
+                pinchStartPos: null
+              };
+            }
+            const handState = handStatesRef.current[index];
+
+            console.log(`Hand ${index + 1} landmarks:`, landmarks.length);
+            const indexTip = landmarks[8];
+            const thumbTip = landmarks[4];
+            console.log(`Hand ${index + 1} index tip: (${indexTip.x.toFixed(2)}, ${indexTip.y.toFixed(2)}), thumb tip: (${thumbTip.x.toFixed(2)}, ${thumbTip.y.toFixed(2)})`);
+
             const color = index === 0 ? "red" : "blue";
             ctx.fillStyle = color;
             ctx.strokeStyle = color;
 
-            // Draw hand landmarks (dots and connections)
             for (const landmark of landmarks) {
               ctx.beginPath();
-              ctx.arc((1 - landmark.x) * canvas.width, landmark.y * canvas.height, 5, 0, 2 * Math.PI);  // Mirror X for flipped canvas
+              ctx.arc((1 - landmark.x) * canvas.width, landmark.y * canvas.height, 5, 0, 2 * Math.PI);
               ctx.fill();
             }
 
-            // Optional label
             const wrist = landmarks[0];
             ctx.fillText(`Hand ${index + 1}`, (1 - wrist.x) * canvas.width, wrist.y * canvas.height - 20);
 
-            // Get mirrored key points for grab logic
-            const indexTip = { x: 1 - landmarks[8].x, y: landmarks[8].y };  // Mirror X
-            const thumbTip = { x: 1 - landmarks[4].x, y: landmarks[4].y };  // Mirror X
-            const wristMirrored = { x: 1 - landmarks[0].x, y: landmarks[0].y };  // Mirror X
+            // Mirrored key points
+            const indexTipMirrored = { x: 1 - landmarks[8].x, y: landmarks[8].y };
+            const thumbTipMirrored = { x: 1 - landmarks[4].x, y: landmarks[4].y };
 
-            // Check pinch
+            // Pinch detection
             const pinchDistance = Math.sqrt(
-              Math.pow(indexTip.x - thumbTip.x, 2) + Math.pow(indexTip.y - thumbTip.y, 2)
+              Math.pow(indexTipMirrored.x - thumbTipMirrored.x, 2) + Math.pow(indexTipMirrored.y - thumbTipMirrored.y, 2)
             );
             const isPinching = pinchDistance < pinchThreshold;
+            console.log(`Hand ${index + 1} pinch distance: ${pinchDistance.toFixed(2)}, pinching: ${isPinching}`);
 
-            // Check proximity to cube (using mirrored coordinates)
-            const cubeX = (cube.position.x / 10) + 0.5;
-            const cubeY = -(cube.position.y / 10) + 0.5;
-            const handToCubeDistance = Math.sqrt(
-              Math.pow(indexTip.x - cubeX, 2) + Math.pow(indexTip.y - cubeY, 2)
-            );
-            const canGrab = handToCubeDistance < grabThreshold;
+            // Show pinch indicator
+            if (isPinching) {
+              pinchIndicatorRef.current.position.set(
+                (indexTipMirrored.x - 0.5) * 10,
+                -(indexTipMirrored.y - 0.5) * 10,
+                0
+              );
+              pinchIndicatorRef.current.visible = true;
+            } else {
+              pinchIndicatorRef.current.visible = false;
+            }
 
-            // Step 4: Adjust grab logic for two hands (choose closest pinching hand)
-            if (isPinching && canGrab && handToCubeDistance < minDistance) {
-              minDistance = handToCubeDistance;
-              closestHand = { indexTip, wrist: wristMirrored };
+            // Anchor cube selection on pinch start
+            if (isPinching && !handState.isDragging) {
+              const mouse = new THREE.Vector2((indexTipMirrored.x - 0.5) * 2, -(indexTipMirrored.y - 0.5) * 2);
+              const raycaster = new THREE.Raycaster();
+              raycaster.setFromCamera(mouse, camera);
+              const intersects = raycaster.intersectObjects(cubesRef.current);
+              if (intersects.length > 0) {
+                handState.anchorCube = intersects[0].object;
+                handState.lastSpawnPos = handState.anchorCube.position.clone();
+                handState.pinchStartPos = new THREE.Vector3(
+                  (indexTipMirrored.x - 0.5) * 10,
+                  -(indexTipMirrored.y - 0.5) * 10,
+                  0
+                );
+                handState.isDragging = true;
+              }
+            }
+
+            // Compute drag delta and spawn along X/Y grid
+            if (isPinching && handState.isDragging) {
+              const currentHandPos = new THREE.Vector3(
+                (indexTipMirrored.x - 0.5) * 10,
+                -(indexTipMirrored.y - 0.5) * 10,
+                0
+              );
+              const deltaX = currentHandPos.x - handState.pinchStartPos.x;
+              const deltaY = currentHandPos.y - handState.pinchStartPos.y;
+
+              // Choose axis (strongest direction)
+              const absDeltaX = Math.abs(deltaX);
+              const absDeltaY = Math.abs(deltaY);
+              let axis = null;
+              let direction = 0;
+              if (absDeltaX > absDeltaY && absDeltaX > dragThreshold) {
+                axis = 'x';
+                direction = deltaX > 0 ? 1 : -1;
+              } else if (absDeltaY > dragThreshold) {
+                axis = 'y';
+                direction = deltaY > 0 ? 1 : -1;
+              }
+
+              if (axis) {
+                // Snap to grid: Increment/decrement by 1 unit
+                const newBlockPos = handState.lastSpawnPos.clone();
+                newBlockPos[axis] += direction;
+                newBlockPos.z = handState.anchorCube.position.z;  // Fixed Z
+
+                const newBlock = new THREE.Mesh(
+                  new THREE.BoxGeometry(1, 1, 1),
+                  new THREE.MeshBasicMaterial({ color: 0x0000ff, transparent: true, opacity: 0.8 })
+                );
+                newBlock.position.copy(newBlockPos);
+                scene.add(newBlock);
+                cubesRef.current.push(newBlock);
+
+                const newOutline = new THREE.Mesh(outlineGeometry, outlineMaterial);
+                newBlock.add(newOutline);
+
+                handState.lastSpawnPos.copy(newBlockPos);
+                handState.pinchStartPos.copy(currentHandPos);
+              }
+            }
+
+            // Release logic
+            if (!isPinching && handState.isDragging) {
+              handState.isDragging = false;
+              handState.anchorCube = null;
+              handState.lastSpawnPos = null;
+              handState.pinchStartPos = null;
             }
           });
-        }
-
-        // Set isGrabbing based on closest hand
-        if (closestHand && !isGrabbingRef.current) {
-          isGrabbingRef.current = true;
-        } else if (!closestHand) {
-          isGrabbingRef.current = false;
-        }
-
-        // Step 3 & 4: Update cube only if grabbed (using mirrored coordinates)
-        if (isGrabbingRef.current && closestHand) {
-          cube.position.x = (closestHand.indexTip.x - 0.5) * 10;
-          cube.position.y = -(closestHand.indexTip.y - 0.5) * 10;
-          cube.rotation.z = (closestHand.wrist.x - 0.5) * Math.PI;
-          cube.material.color.setHex(0xff0000);  // Red when grabbed
-        } else {
-          cube.material.color.setHex(0x00ff00);  // Green when released
         }
       }
 
@@ -176,12 +248,12 @@ function App() {
 
   return (
     <div style={{ textAlign: "center", position: "relative" }}>
-      <h2>Two-Hand Tracked 3D Cube (Mirrored Camera)</h2>
+      <h2>Grid-Based X/Y Spawning Along Anchor Cube</h2>
       <div id="three-container" style={{ position: "absolute", top: 50, left: "50%", transform: "translateX(-50%)" }}></div>
       <video ref={videoRef} autoPlay playsInline width="640" height="480" style={{ display: "none" }} />
       <canvas ref={canvasRef} width="640" height="480" />
-      <p>Put both hands in frame: Red dots for Hand 1, Blue for Hand 2. Pinch near cube with closest hand to grab (red), move/rotate. Open to release (green). Mirrored for natural movement!</p>
-      <p>Thresholds: Pinch threshold {pinchThreshold.toFixed(2)}, Grab threshold {grabThreshold.toFixed(2)} (adjust in code if needed).</p>
+      <p>Check console for logs. Red sphere shows pinch. Pinch a cube to select anchor, drag along X or Y to spawn blue blocks snapped to grid in that plane (Z fixed). Release to stop. Multi-hand supported.</p>
+      <p>Thresholds: Pinch {pinchThreshold.toFixed(2)}, Drag {dragThreshold} (adjust in code).</p>
     </div>
   );
 }
