@@ -13,6 +13,10 @@ function App() {
   const startedRef = useRef(false);
   const isGrabbingRef = useRef(false);
 
+  // Tunable thresholds (adjust these for your setup)
+  const pinchThreshold = 0.05;  // Distance between thumb & index to register pinch
+  const grabThreshold = 0.15;   // Distance from hand to cube to allow grabbing
+
   useEffect(() => {
     if (startedRef.current) return;
     startedRef.current = true;
@@ -29,12 +33,18 @@ function App() {
     renderer.setSize(640, 480);
     rendererRef.current = renderer;
 
-    // Create cube
+    // Create cube with subtle outline for "grabbable" feedback
     const geometry = new THREE.BoxGeometry(1, 1, 1);
-    const material = new THREE.MeshBasicMaterial({ color: 0x00ff00 });
+    const material = new THREE.MeshBasicMaterial({ color: 0x00ff00, transparent: true, opacity: 0.8 });
     const cube = new THREE.Mesh(geometry, material);
     scene.add(cube);
     cubeRef.current = cube;
+
+    // Add subtle outline (wireframe) to indicate grabbable state
+    const outlineGeometry = new THREE.BoxGeometry(1.05, 1.05, 1.05);
+    const outlineMaterial = new THREE.MeshBasicMaterial({ color: 0xffffff, wireframe: true });
+    const outline = new THREE.Mesh(outlineGeometry, outlineMaterial);
+    cube.add(outline);  // Attach to cube
 
     // Append renderer to DOM
     const container = document.getElementById("three-container");
@@ -47,7 +57,7 @@ function App() {
     };
     animate();
 
-    // Setup hand tracking
+    // Step 1: Enable two-hand detection
     const runHandLandmarker = async () => {
       const vision = await FilesetResolver.forVisionTasks(
         "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.0/wasm"
@@ -58,7 +68,7 @@ function App() {
           delegate: "GPU"
         },
         runningMode: "VIDEO",
-        numHands: 1,
+        numHands: 2,  // Detect up to 2 hands
         minHandDetectionConfidence: 0.5,
         minHandPresenceConfidence: 0.5,
         minTrackingConfidence: 0.5
@@ -81,44 +91,80 @@ function App() {
       const canvas = canvasRef.current;
       const ctx = canvas.getContext("2d");
 
+      // Step 3: Apply camera inversion (flip horizontally for natural interaction)
       ctx.clearRect(0, 0, canvas.width, canvas.height);
-      ctx.drawImage(videoRef.current, 0, 0, canvas.width, canvas.height);
+      ctx.save();
+      ctx.scale(-1, 1);  // Horizontal flip
+      ctx.drawImage(videoRef.current, -canvas.width, 0, canvas.width, canvas.height);
+      ctx.restore();
 
       if (handLandmarkerRef.current && videoRef.current) {
         const results = handLandmarkerRef.current.detectForVideo(videoRef.current, Date.now());
 
-        if (results.landmarks && results.landmarks.length > 0) {
-          const landmarks = results.landmarks[0];
+        let closestHand = null;
+        let minDistance = Infinity;
 
-          // Draw hand dots
-          ctx.fillStyle = "red";
-          for (const landmark of landmarks) {
-            ctx.beginPath();
-            ctx.arc(landmark.x * canvas.width, landmark.y * canvas.height, 5, 0, 2 * Math.PI);
-            ctx.fill();
-          }
+        // Step 2: Update rendering loop for both hands
+        if (results.landmarks) {
+          results.landmarks.forEach((landmarks, index) => {
+            // Assign colors: Hand 1 → red, Hand 2 → blue
+            const color = index === 0 ? "red" : "blue";
+            ctx.fillStyle = color;
+            ctx.strokeStyle = color;
 
-          // Get key points
-          const indexTip = landmarks[8];  // Index finger tip
-          const thumbTip = landmarks[4];  // Thumb tip
-          const wrist = landmarks[0];  // Wrist
+            // Draw hand landmarks (dots and connections)
+            for (const landmark of landmarks) {
+              ctx.beginPath();
+              ctx.arc((1 - landmark.x) * canvas.width, landmark.y * canvas.height, 5, 0, 2 * Math.PI);  // Mirror X for flipped canvas
+              ctx.fill();
+            }
 
-          // Pinch detection (grab/release)
-          const distance = Math.sqrt(
-            Math.pow(indexTip.x - thumbTip.x, 2) + Math.pow(indexTip.y - thumbTip.y, 2)
-          );
-          const pinchThreshold = 0.05;  // Adjust for sensitivity
-          isGrabbingRef.current = distance < pinchThreshold;
+            // Optional label
+            const wrist = landmarks[0];
+            ctx.fillText(`Hand ${index + 1}`, (1 - wrist.x) * canvas.width, wrist.y * canvas.height - 20);
 
-          // Update cube if grabbing
-          if (isGrabbingRef.current) {
-            cube.position.x = (indexTip.x - 0.5) * 10;  // Map to scene (-5 to 5)
-            cube.position.y = -(indexTip.y - 0.5) * 10;
-            cube.rotation.z = (wrist.x - 0.5) * Math.PI;  // Rotate based on wrist
-            cube.material.color.setHex(0xff0000);  // Red when grabbed
-          } else {
-            cube.material.color.setHex(0x00ff00);  // Green when released
-          }
+            // Get mirrored key points for grab logic
+            const indexTip = { x: 1 - landmarks[8].x, y: landmarks[8].y };  // Mirror X
+            const thumbTip = { x: 1 - landmarks[4].x, y: landmarks[4].y };  // Mirror X
+            const wristMirrored = { x: 1 - landmarks[0].x, y: landmarks[0].y };  // Mirror X
+
+            // Check pinch
+            const pinchDistance = Math.sqrt(
+              Math.pow(indexTip.x - thumbTip.x, 2) + Math.pow(indexTip.y - thumbTip.y, 2)
+            );
+            const isPinching = pinchDistance < pinchThreshold;
+
+            // Check proximity to cube (using mirrored coordinates)
+            const cubeX = (cube.position.x / 10) + 0.5;
+            const cubeY = -(cube.position.y / 10) + 0.5;
+            const handToCubeDistance = Math.sqrt(
+              Math.pow(indexTip.x - cubeX, 2) + Math.pow(indexTip.y - cubeY, 2)
+            );
+            const canGrab = handToCubeDistance < grabThreshold;
+
+            // Step 4: Adjust grab logic for two hands (choose closest pinching hand)
+            if (isPinching && canGrab && handToCubeDistance < minDistance) {
+              minDistance = handToCubeDistance;
+              closestHand = { indexTip, wrist: wristMirrored };
+            }
+          });
+        }
+
+        // Set isGrabbing based on closest hand
+        if (closestHand && !isGrabbingRef.current) {
+          isGrabbingRef.current = true;
+        } else if (!closestHand) {
+          isGrabbingRef.current = false;
+        }
+
+        // Step 3 & 4: Update cube only if grabbed (using mirrored coordinates)
+        if (isGrabbingRef.current && closestHand) {
+          cube.position.x = (closestHand.indexTip.x - 0.5) * 10;
+          cube.position.y = -(closestHand.indexTip.y - 0.5) * 10;
+          cube.rotation.z = (closestHand.wrist.x - 0.5) * Math.PI;
+          cube.material.color.setHex(0xff0000);  // Red when grabbed
+        } else {
+          cube.material.color.setHex(0x00ff00);  // Green when released
         }
       }
 
@@ -130,11 +176,12 @@ function App() {
 
   return (
     <div style={{ textAlign: "center", position: "relative" }}>
-      <h2>Hand-Tracked 3D Cube</h2>
+      <h2>Two-Hand Tracked 3D Cube (Mirrored Camera)</h2>
       <div id="three-container" style={{ position: "absolute", top: 50, left: "50%", transform: "translateX(-50%)" }}></div>
       <video ref={videoRef} autoPlay playsInline width="640" height="480" style={{ display: "none" }} />
       <canvas ref={canvasRef} width="640" height="480" />
-      <p>Pinch (thumb + index) to grab/move/rotate the cube. Open hand to release.</p>
+      <p>Put both hands in frame: Red dots for Hand 1, Blue for Hand 2. Pinch near cube with closest hand to grab (red), move/rotate. Open to release (green). Mirrored for natural movement!</p>
+      <p>Thresholds: Pinch threshold {pinchThreshold.toFixed(2)}, Grab threshold {grabThreshold.toFixed(2)} (adjust in code if needed).</p>
     </div>
   );
 }
