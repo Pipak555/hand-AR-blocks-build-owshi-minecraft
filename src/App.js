@@ -10,13 +10,15 @@ function App() {
   const rendererRef = useRef(null);
   const cameraRef = useRef(null);
   const startedRef = useRef(false);
-  const cubesRef = useRef([]);  // Array of all cubes
+  const cubesRef = useRef([]);  // Array of all cubes (for raycasting against any)
   const handStatesRef = useRef([]);  // Per-hand state: { isDragging, anchorCube, lastSpawnPos, pinchStartPos }
   const pinchIndicatorRef = useRef(null);  // Visual indicator for pinch
+  const highlightRef = useRef(null);  // Optional highlight for anchor cube
 
   // Tunable thresholds
   const pinchThreshold = 0.05;
-  const dragThreshold = 0.5;  // Distance to drag before spawning
+  const dragThreshold = 0.5;  // Distance to drag before checking snap
+  const gridUnit = 1;  // Grid size (1 unit = full cube size)
 
   useEffect(() => {
     if (startedRef.current) return;
@@ -56,6 +58,14 @@ function App() {
     pinchIndicator.visible = false;
     scene.add(pinchIndicator);
     pinchIndicatorRef.current = pinchIndicator;
+
+    // Optional highlight for anchor cube (yellow outline)
+    const highlightGeometry = new THREE.BoxGeometry(1.1, 1.1, 1.1);
+    const highlightMaterial = new THREE.MeshBasicMaterial({ color: 0xffff00, wireframe: true, transparent: true, opacity: 0.5 });
+    const highlight = new THREE.Mesh(highlightGeometry, highlightMaterial);
+    highlight.visible = false;
+    scene.add(highlight);
+    highlightRef.current = highlight;
 
     // Append renderer
     const container = document.getElementById("three-container");
@@ -166,12 +176,12 @@ function App() {
               pinchIndicatorRef.current.visible = false;
             }
 
-            // Anchor cube selection on pinch start
+            // Only spawn relative to the cube being pinched (raycast to select anchor)
             if (isPinching && !handState.isDragging) {
               const mouse = new THREE.Vector2((indexTipMirrored.x - 0.5) * 2, -(indexTipMirrored.y - 0.5) * 2);
               const raycaster = new THREE.Raycaster();
               raycaster.setFromCamera(mouse, camera);
-              const intersects = raycaster.intersectObjects(cubesRef.current);
+              const intersects = raycaster.intersectObjects(cubesRef.current);  // Raycast against all cubes
               if (intersects.length > 0) {
                 handState.anchorCube = intersects[0].object;
                 handState.lastSpawnPos = handState.anchorCube.position.clone();
@@ -181,10 +191,14 @@ function App() {
                   0
                 );
                 handState.isDragging = true;
+
+                // Optional highlight for anchor cube
+                highlightRef.current.position.copy(handState.anchorCube.position);
+                highlightRef.current.visible = true;
               }
             }
 
-            // Compute drag delta and spawn along X/Y grid
+            // Compute drag delta, snap to grid in X/Y relative to anchor, only spawn if position changed
             if (isPinching && handState.isDragging) {
               const currentHandPos = new THREE.Vector3(
                 (indexTipMirrored.x - 0.5) * 10,
@@ -208,33 +222,38 @@ function App() {
               }
 
               if (axis) {
-                // Snap to grid: Increment/decrement by 1 unit
-                const newBlockPos = handState.lastSpawnPos.clone();
-                newBlockPos[axis] += direction;
+                // Snap to grid: Calculate snapped position relative to anchor
+                const snappedDelta = Math.round((axis === 'x' ? deltaX : deltaY) / gridUnit) * gridUnit;
+                const newBlockPos = handState.anchorCube.position.clone();
+                newBlockPos[axis] += snappedDelta;
                 newBlockPos.z = handState.anchorCube.position.z;  // Fixed Z
 
-                const newBlock = new THREE.Mesh(
-                  new THREE.BoxGeometry(1, 1, 1),
-                  new THREE.MeshBasicMaterial({ color: 0x0000ff, transparent: true, opacity: 0.8 })
-                );
-                newBlock.position.copy(newBlockPos);
-                scene.add(newBlock);
-                cubesRef.current.push(newBlock);
+                // Only spawn if snapped position differs from last spawn
+                if (!handState.lastSpawnPos.equals(newBlockPos)) {
+                  const newBlock = new THREE.Mesh(
+                    new THREE.BoxGeometry(1, 1, 1),
+                    new THREE.MeshBasicMaterial({ color: 0x0000ff, transparent: true, opacity: 0.8 })
+                  );
+                  newBlock.position.copy(newBlockPos);
+                  scene.add(newBlock);
+                  cubesRef.current.push(newBlock);  // Add to cubes for future raycasting
 
-                const newOutline = new THREE.Mesh(outlineGeometry, outlineMaterial);
-                newBlock.add(newOutline);
+                  const newOutline = new THREE.Mesh(outlineGeometry, outlineMaterial);
+                  newBlock.add(outline);
 
-                handState.lastSpawnPos.copy(newBlockPos);
-                handState.pinchStartPos.copy(currentHandPos);
+                  handState.lastSpawnPos.copy(newBlockPos);
+                  handState.pinchStartPos.copy(currentHandPos);
+                }
               }
             }
 
-            // Release logic
+            // Release logic (stop spawning, hide highlight)
             if (!isPinching && handState.isDragging) {
               handState.isDragging = false;
               handState.anchorCube = null;
               handState.lastSpawnPos = null;
               handState.pinchStartPos = null;
+              highlightRef.current.visible = false;
             }
           });
         }
@@ -248,12 +267,12 @@ function App() {
 
   return (
     <div style={{ textAlign: "center", position: "relative" }}>
-      <h2>Grid-Based X/Y Spawning Along Anchor Cube</h2>
+      <h2>Refined Grid Snapping Relative to Pinched Cube</h2>
       <div id="three-container" style={{ position: "absolute", top: 50, left: "50%", transform: "translateX(-50%)" }}></div>
       <video ref={videoRef} autoPlay playsInline width="640" height="480" style={{ display: "none" }} />
       <canvas ref={canvasRef} width="640" height="480" />
-      <p>Check console for logs. Red sphere shows pinch. Pinch a cube to select anchor, drag along X or Y to spawn blue blocks snapped to grid in that plane (Z fixed). Release to stop. Multi-hand supported.</p>
-      <p>Thresholds: Pinch {pinchThreshold.toFixed(2)}, Drag {dragThreshold} (adjust in code).</p>
+      <p>Check console for logs. Red sphere shows pinch, yellow outline highlights pinched cube. Pinch any cube to select anchor, drag along X or Y to spawn blue blocks snapped to grid relative to anchor (Z fixed). Release to stop. Multi-hand supported.</p>
+      <p>Thresholds: Pinch {pinchThreshold.toFixed(2)}, Drag {dragThreshold}, Grid {gridUnit} (adjust in code).</p>
     </div>
   );
 }
